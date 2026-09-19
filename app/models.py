@@ -549,3 +549,105 @@ class TemperatureAuditResponse(BaseModel):
     max_deviation: Optional[TemperatureMaxDeviation] = Field(
         default=None, description="全局最大偏差及其溯源；无任何越界时为 null"
     )
+
+
+# ---------------------------------------------------------------------------
+# 封签库存分配规划（/api/v1/seal-chain/allocation-plan）
+# ---------------------------------------------------------------------------
+
+
+class PendingUse(BaseModel):
+    """待用记录：某条链计划由指定保管人在 use_at 时刻使用一枚封签。"""
+
+    chain_id: str = Field(description="待用记录所属链标识（回显用）")
+    custodian: str = Field(min_length=1, description="计划使用封签的保管人")
+    use_at: datetime = Field(description="计划使用时间（ISO 8601）")
+
+
+class InventorySeal(BaseModel):
+    """一枚库存封签：编号、过期时间与允许使用的保管人名单。"""
+
+    seal_id: str = Field(min_length=1, description="库存封签编号，请求内不可重复")
+    expires_at: datetime = Field(
+        description="过期时间；use_at 必须严格早于该时刻，封签才可用"
+    )
+    allowed_custodians: List[str] = Field(
+        default_factory=list,
+        description="允许使用该封签的保管人名单；空列表表示不允许任何保管人",
+    )
+
+
+class AllocationPlanRequest(BaseModel):
+    """封签库存分配规划请求：事件链（复用批量校验）、待用记录与库存封签。"""
+
+    chains: List[ChainEvents] = Field(
+        default_factory=list,
+        description="事件链，结构同批量校验；各链有效 seal/reseal 事件占用的编号不可分配",
+    )
+    pending: List[PendingUse] = Field(
+        default_factory=list, description="待用记录，按输入顺序参与分配"
+    )
+    inventory: List[InventorySeal] = Field(
+        default_factory=list, description="库存封签；seal_id 在请求内不可重复"
+    )
+
+    @model_validator(mode="after")
+    def _ids_must_be_unique(self) -> "AllocationPlanRequest":
+        seen_chains: set[str] = set()
+        for chain in self.chains:
+            if chain.chain_id in seen_chains:
+                raise ValueError(f"批次内 chain_id 不可重复：{chain.chain_id}")
+            seen_chains.add(chain.chain_id)
+        seen_seals: set[str] = set()
+        for seal in self.inventory:
+            if seal.seal_id in seen_seals:
+                raise ValueError(f"库存封签编号不可重复：{seal.seal_id}")
+            seen_seals.add(seal.seal_id)
+        return self
+
+
+class AllocationRecordResult(BaseModel):
+    """单条待用记录的分配结果。"""
+
+    index: int = Field(description="待用记录下标（从 0 开始，对应请求 pending 中的位置）")
+    chain_id: str = Field(description="回显待用记录所属链标识")
+    custodian: str = Field(description="回显计划保管人")
+    use_at: datetime = Field(description="回显计划使用时间")
+    status: str = Field(description="assigned（已分配）或 unassigned（未分配）")
+    seal_id: Optional[str] = Field(
+        default=None, description="分配到的库存封签编号；unassigned 时为 null"
+    )
+    reason: Optional[str] = Field(
+        default=None,
+        description="未分配原因：no_candidate（无任何候选封签）或 "
+        "outcompeted（有候选封签但在全局最优方案中落选）；assigned 时为 null",
+    )
+
+
+class AllocationSummary(BaseModel):
+    """封签库存分配规划汇总。"""
+
+    assigned: int = Field(description="已分配的待用记录数")
+    unassigned: int = Field(description="未分配的待用记录数")
+    no_candidate: int = Field(description="未分配记录中无候选封签的数量")
+    outcompeted: int = Field(description="未分配记录中有候选但竞争淘汰的数量")
+    total_slack_seconds: float = Field(
+        description="全局最优方案的总秒数：已分配边的 Σ(expires_at - use_at)"
+    )
+
+
+class AllocationPlanResponse(BaseModel):
+    """封签库存分配规划响应：保留批量校验结果，另附全局最优分配明细。"""
+
+    batch_validation: BatchValidateResponse = Field(
+        description="复用批量校验的原始结果（结构同 /batch-validate）；"
+        "其中有效 seal/reseal 事件占用的编号不参与分配"
+    )
+    excluded_seal_ids: List[str] = Field(
+        default_factory=list,
+        description="库存中因编号已被有效 seal/reseal 占用而排除的封签编号，按字典序排列",
+    )
+    records: List[AllocationRecordResult] = Field(
+        description="每条待用记录的分配结果，按请求 pending 顺序"
+    )
+    summary: AllocationSummary = Field(description="分配结果汇总")

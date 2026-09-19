@@ -3,11 +3,14 @@ from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 
+from .allocation import AllocationPlanError, plan_allocation
 from .batch import validate_batch
 from .chunk import ChunkValidateError, validate_chunk
 from .exposure import ExposureAuditError, audit_exposure
 from .handover import HandoverPlanAuditError, audit_handover_plan
 from .models import (
+    AllocationPlanRequest,
+    AllocationPlanResponse,
     BatchValidateRequest,
     BatchValidateResponse,
     ChunkValidateRequest,
@@ -30,7 +33,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -148,4 +151,24 @@ def temperature_audit(request: TemperatureAuditRequest) -> TemperatureAuditRespo
     try:
         return audit_temperature(request)
     except TemperatureAuditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/allocation-plan",
+    response_model=AllocationPlanResponse,
+    tags=["seal-chain"],
+    summary="封签库存分配规划：待用记录与库存封签的一对一全局最优分配",
+)
+def allocation_plan(request: AllocationPlanRequest) -> AllocationPlanResponse:
+    """复用批量校验排除各链有效 seal/reseal 已占用的封签编号（结果原样保留在
+    batch_validation），再在未过期（use_at 严格早于 expires_at）且保管人允许的
+    候选边上做一对一全局最优分配（状态压缩动态规划，不做逐条贪心），目标依次为：
+    最大化满足的记录数、最小化 Σ(expires_at - use_at) 总秒数、按待用记录输入
+    顺序与 seal_id 字典序确定唯一方案。返回每条记录的 assigned/unassigned、
+    分配编号及未分配原因（no_candidate 无候选 / outcompeted 竞争淘汰）。
+    输入时间混用带时区与不带时区、库存 seal_id 重复或 chain_id 重复时返回 422。"""
+    try:
+        return plan_allocation(request)
+    except AllocationPlanError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
