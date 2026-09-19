@@ -7,6 +7,7 @@ from .batch import validate_batch
 from .chunk import ChunkValidateError, validate_chunk
 from .exposure import ExposureAuditError, audit_exposure
 from .handover import HandoverPlanAuditError, audit_handover_plan
+from .inventory import SealInventoryPlanError, plan_seal_inventory
 from .models import (
     BatchValidateRequest,
     BatchValidateResponse,
@@ -18,6 +19,8 @@ from .models import (
     HandoverPlanAuditResponse,
     ReconcileRequest,
     ReconcileResponse,
+    SealInventoryPlanRequest,
+    SealInventoryPlanResponse,
     TemperatureAuditRequest,
     TemperatureAuditResponse,
     ValidateRequest,
@@ -30,7 +33,7 @@ from .validator import validate_events
 app = FastAPI(
     title="封签链校验 API",
     description="用于展品运输交接场景的封签链状态机校验服务",
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -148,4 +151,25 @@ def temperature_audit(request: TemperatureAuditRequest) -> TemperatureAuditRespo
     try:
         return audit_temperature(request)
     except TemperatureAuditError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post(
+    "/api/v1/seal-chain/seal-inventory-plan",
+    response_model=SealInventoryPlanResponse,
+    tags=["seal-chain"],
+    summary="封签库存分配规划：批量占用排除后的一对一全局最优分配",
+)
+def seal_inventory_plan(request: SealInventoryPlanRequest) -> SealInventoryPlanResponse:
+    """先复用批量封签占用检查，排除任何链中已被有效 seal/reseal 使用的库存编号；
+    再在 use_at 严格早于 expires_at（到期时间不含）且保管人在允许名单内的边上做
+    记录与封签的一对一全局最优分配（最小费用流，不做逐条贪心）：先最大化满足记录数，
+    再最小化 expires_at-use_at 的总秒数，仍并列时按待用记录输入顺序逐条比较、
+    封签取 seal_id 字典序最小者确定唯一方案。逐条返回 assigned/unassigned、
+    分配编号、到期余量及无候选（no_candidate）或竞争淘汰（competition）原因。
+    库存封签 seal_id 重复、chain_id 重复、待用记录引用不存在的 chain_id、
+    或时间混用带时区与不带时区时返回 422。"""
+    try:
+        return plan_seal_inventory(request)
+    except SealInventoryPlanError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

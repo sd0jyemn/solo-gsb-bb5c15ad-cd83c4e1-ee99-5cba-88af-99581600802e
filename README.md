@@ -1,6 +1,6 @@
 # 封签链校验 API（Seal Chain Validation）
 
-用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
+用于展品运输交接场景的封签链校验服务。客户端提交按时间排列的 **封装 / 交接 / 开封 / 重封** 事件序列，服务按状态机逐事件校验，返回最终保管人、当前封签、逐事件状态及全部违规事件的位置与原因；同时提供**批量封签占用检查**接口，对多条事件链做跨链 `seal_id` 占用冲突检测；提供**离线片段合并重建**接口，将同一 `chain_id` 的多个离线片段按 `event_id` 去重、按 `prev_event_id` 重建唯一序列后再校验；提供**开封暴露审计**接口，以有效开封 / 重封事件推导开封区间，相对授权开窗窗口做区间差，输出未授权暴露时长；提供**交接计划符合性审计**接口，把有效封装 / 重封 / 交接事件提取为实际到任记录，与按序计划节点做保管人相同、顺序不交叉的全局最优匹配；提供**温控责任审计**接口，以有效封装 / 重封 / 交接事件生成保管人半开区间，把按前值保持得到的越界温度区间与保管人区间求交、跨交接点拆分，按保管人汇总高温 / 低温秒数、最大偏差与未归属时长；提供**封签库存分配规划**接口，先复用批量校验排除已被有效 seal/reseal 占用的库存编号，再在“未过期 + 保管人允许”的可行边上做一对一全局最优分配（最大化满足数、最小化到期余量总秒数、按记录输入顺序与 `seal_id` 字典序确定唯一方案）；并提供**分段校验**接口，把超长事件链拆成若干段依次校验，段间通过带签名的续传令牌传递状态机状态，结果与整链一次校验完全一致。
 
 ## 校验规则（状态机）
 
@@ -597,6 +597,126 @@ curl -s http://localhost:8000/api/v1/seal-chain/temperature-audit \
 # 高温越界 600 秒归 Alice：custodians[0].high_seconds = 600.0
 ```
 
+### `POST /api/v1/seal-chain/seal-inventory-plan`
+
+封签库存分配规划。在封发作业前，把若干条**待用记录**（某保管人将于 `use_at` 在某条链上启用一枚封签）与一批**库存封签**（`seal_id`、`expires_at`、允许保管人名单）做一对一分配规划。处理分三步：
+
+1. **复用批量封签占用检查**：请求携带的 `chains` 原样走一遍 `/batch-validate`，响应中保留其完整结果 `batch_validation`；任何链中被**有效** seal/reseal 事件（`status = ok`）占用的编号都从分配池中排除（**跨链冲突编号同样排除**——冲突只在批量结果中标记，不改变“该编号已被有效占用”的事实；违规事件中的编号不构成占用、不排除）；
+2. **建立可行边**：对每条待用记录与每枚剩余库存封签，当且仅当 `use_at` **严格早于** `expires_at`（到期时间为半开边界，相等即已过期）且记录保管人在该封签 `allowed_custodians` 名单中时构成一条候选边；
+3. **一对一全局最优分配**（最小费用最大流求解，**不做逐条贪心**），目标依次为：
+   1. **最大化满足（assigned）记录数**；
+   2. 满足记录数相同时，**最小化全部已分配边的到期余量总秒数**（`expires_at - use_at`）；
+   3. 仍并列时，按待用记录**输入顺序**逐条比较，已分配优先、封签取 **`seal_id` 字典序**最小者，确定**唯一方案**（可理解为按记录顺序排列的“分配封签字典序名次 / 未分配”序列取字典序最小）。
+
+每条待用记录返回 `assigned` / `unassigned`：已分配时给出 `seal_id` 与该边余量 `slack_seconds`；未分配时给出原因码——`no_candidate`（排除占用后不存在任何未过期且保管人允许的候选，原因串中含已占用 / 已过期 / 保管人不允许计数）或 `competition`（存在候选，但在最大化满足数的全局一对一中候选封签全部分给了其他记录；`candidate_seal_ids` 按字典序列出全部候选，`competition[]` 逐候选给出最终分得该封签的记录下标 `assigned_record_index`）。
+
+**请求体**
+
+```json
+{
+  "chains": [
+    {"chain_id": "chain-a", "events": [
+      {"type": "seal", "timestamp": "2026-09-19T08:00:00Z", "seal_id": "USED", "custodian": "Alice"}
+    ]}
+  ],
+  "records": [
+    {"chain_id": "chain-a", "custodian": "Alice", "use_at": "2026-09-19T10:00:00Z"},
+    {"chain_id": "chain-a", "custodian": "Alice", "use_at": "2026-09-19T10:00:00Z"}
+  ],
+  "seals": [
+    {"seal_id": "USED", "expires_at": "2026-09-19T18:00:00Z", "allowed_custodians": ["Alice"]},
+    {"seal_id": "S2", "expires_at": "2026-09-19T12:00:00Z", "allowed_custodians": ["Alice", "Bob"]},
+    {"seal_id": "S1", "expires_at": "2026-09-19T13:00:00Z", "allowed_custodians": ["Alice"]}
+  ]
+}
+```
+
+- `chains[]`：与 `/batch-validate` 完全相同的输入，`chain_id` 批次内不可重复；允许空列表。
+- `records[]`：待用记录，**按输入顺序排列**（该顺序参与并列方案的唯一确定）；`chain_id` 必须出现在 `chains` 中，否则 `422`；记录本身允许完全重复（同一时刻同一保管人可有多条待用需求，各自竞争封签）。
+- `seals[]`：库存封签，**`seal_id` 不可重复（重复返回 `422`）**；`allowed_custodians` 至少一人。
+
+**响应示例**（对应上例：`USED` 已被有效 seal 占用而排除；两条记录分别取得余量更大的 `S1` 与余量更小的 `S2`，总余量 18000 秒）
+
+```json
+{
+  "batch_validation": {
+    "valid": true,
+    "chains": [
+      {"chain_id": "chain-a", "valid": true, "sealed": true, "final_custodian": "Alice",
+       "current_seal": "USED",
+       "events": [
+         {"index": 0, "type": "seal", "status": "ok", "reason": null, "cross_chain_conflict": false}
+       ],
+       "violations": []}
+    ],
+    "conflicts": [],
+    "summary": [{"chain_id": "chain-a", "valid": true, "conflicts": 0}]
+  },
+  "results": [
+    {"index": 0, "chain_id": "chain-a", "custodian": "Alice",
+     "use_at": "2026-09-19T10:00:00Z",
+     "status": "assigned", "seal_id": "S1", "slack_seconds": 10800.0,
+     "reason_code": null, "reason": null,
+     "candidate_seal_ids": [], "competition": []},
+    {"index": 1, "chain_id": "chain-a", "custodian": "Alice",
+     "use_at": "2026-09-19T10:00:00Z",
+     "status": "assigned", "seal_id": "S2", "slack_seconds": 7200.0,
+     "reason_code": null, "reason": null,
+     "candidate_seal_ids": [], "competition": []}
+  ],
+  "excluded_inventory": [
+    {"seal_id": "USED", "occupied_by": [
+      {"seal_id": "USED", "chain_id": "chain-a", "event_index": 0, "first_chain_id": "chain-a"}
+    ]}
+  ],
+  "summary": {"assigned": 2, "unassigned": 0, "no_candidate": 0, "competition": 0,
+              "total_slack_seconds": 18000.0, "available_seals": 2}
+}
+```
+
+**竞争淘汰示例**（两条记录仅有同一枚候选 `S1`，记录 1 被淘汰）
+
+```json
+{
+  "index": 1, "chain_id": "chain-a", "custodian": "Alice",
+  "use_at": "2026-09-19T10:00:00Z",
+  "status": "unassigned", "seal_id": null, "slack_seconds": null,
+  "reason_code": "competition",
+  "reason": "存在 1 个候选封签，但在最大化满足记录数的一对一全局分配中全部被其他记录取得而淘汰（非逐条贪心结果）",
+  "candidate_seal_ids": ["S1"],
+  "competition": [{"seal_id": "S1", "assigned_record_index": 0}]
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `batch_validation` | 对 `chains` 复用 `/batch-validate` 的**完整原始结果**；其中 `status=ok` 的 seal/reseal 占用编号不参与分配 |
+| `results[]` | 每条待用记录的结果，按请求 `records` 顺序；含回显的 `chain_id` / `custodian` / `use_at` |
+| `results[].status` | `assigned`（已分配）或 `unassigned`（未分配） |
+| `results[].seal_id` / `slack_seconds` | 分配编号与该边余量秒数（`expires_at - use_at`）；未分配时均为 `null` |
+| `results[].reason_code` | `no_candidate`（无候选）/ `competition`（竞争淘汰）；已分配时为 `null` |
+| `results[].candidate_seal_ids` | 该记录的全部可行候选编号（`seal_id` 字典序）；`competition` 时据此查看竞争面，已分配时为空 |
+| `results[].competition[]` | 竞争淘汰时逐候选给出 `seal_id` 与其最终归属记录 `assigned_record_index`；其余情况为空 |
+| `excluded_inventory[]` | 因已被有效 seal/reseal 占用而排除的库存封签，按 `seal_id` 字典序；`occupied_by[]` 列出占用事件（结构同批量冲突项，含跨链的首次占用锚点） |
+| `summary` | `assigned` / `unassigned` 数量、其中 `no_candidate` 与 `competition` 数量、已分配边 `total_slack_seconds`、排除后入池的 `available_seals` |
+
+> 链自身存在状态机违规或跨链冲突**不影响**接口返回 `200`，情况只体现在 `batch_validation` 中（但冲突 / 有效占用的编号仍会被排除）。以下情况返回 `422`：库存封签 `seal_id` 重复、批次内 `chain_id` 重复、`allowed_custodians` 为空、待用记录引用了不存在的 `chain_id`，以及事件 / `use_at` / `expires_at` 混用带时区与不带时区的时间。
+
+### 封签库存分配规划接口示例调用
+
+```bash
+curl -s http://localhost:8000/api/v1/seal-chain/seal-inventory-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"chains": [],
+        "records": [
+          {"chain_id": "chain-a", "custodian": "Alice", "use_at": "2026-09-19T10:00:00Z"}
+        ],
+        "seals": [
+          {"seal_id": "S1", "expires_at": "2026-09-19T10:00:00Z", "allowed_custodians": ["Alice"]}
+        ]}'
+# use_at 恰等于 expires_at（到期时间不含）：该记录 status=unassigned, reason_code=no_candidate
+```
+
 ### `POST /api/v1/seal-chain/validate-chunk`
 
 分段校验超长事件链。把一条长链拆成若干段依次提交：**首段不带 `continuation_token`**，响应返回不透明的**续传令牌**；后续段携带上一响应返回的令牌，即可从上一段结束时的状态机状态继续校验。**逐事件判定与把所有分段拼接后调用 `/api/v1/seal-chain/validate` 完全一致**，响应中的 `index` 为全链偏移（从 0 开始）。
@@ -721,13 +841,14 @@ uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py        # FastAPI 入口与路由
-  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计与分段校验）
+  models.py      # 请求 / 响应模型（单链、批量、合并重建、开封暴露审计、交接计划审计、温控责任审计、库存分配规划与分段校验）
   validator.py   # 单链状态机校验核心
   batch.py       # 批量封签占用检查（跨链冲突）
   reconcile.py   # 离线片段合并重建（去重 / 结构诊断 / 调用单链校验）
   exposure.py    # 开封暴露审计（开封区间推导 / 窗口合并 / 区间差）
   handover.py    # 交接计划符合性审计（实际到任提取 / 全局最优匹配动态规划）
   temperature.py # 温控责任审计（保管人区间 / 前值保持越界区间 / 求交拆分与汇总）
+  inventory.py   # 封签库存分配规划（批量占用排除 / 最小费用流一对一全局最优分配）
   chunk.py       # 分段校验（续传令牌签发 / 验签 / 状态还原）
 tests/
   test_validator.py
@@ -736,6 +857,7 @@ tests/
   test_exposure.py
   test_handover.py
   test_temperature.py
+  test_inventory.py
   test_chunk.py
 Dockerfile
 docker-compose.yml
